@@ -145,8 +145,8 @@ QAE EV (mean over walls) per Discard:
  1m  2m  3m  ... 8m
 
 Detailed EVs:
- 1m (x2): EV = 823.20
- 2m (x2): EV = 851.34
+ 1m (x2): EV = 851.20
+ 2m (x2): EV = 823.34
  ...
 Recommended discard: 2m (Avg QAE EV: 851.34)
 ```
