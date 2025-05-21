@@ -1,132 +1,125 @@
-import pennylane as qml
+import streamlit as st
+from PIL import ImageFont, ImageDraw, Image
 import numpy as np
-from collections import Counter
-from score_calculator import ScoreCalculator
-from utils import pretty, shuffled_zero_to_33, std_shanten
-from tqdm import tqdm
-hand14 = [0, 0, 1, 1, 2, 2, 3, 3, 4, 5, 6, 7, 8, 8]
-sc = ScoreCalculator()
-def future_hands_scores(hand14, discard_tile, wall):
-    base_hand = hand14.copy()
-    base_hand.remove(discard_tile)
-    n = len(wall)
-    hands_scores = []
-    for i in range(n):
-        draw1 = wall[i]
-        wall1 = wall[:i] + wall[i+1:]
-        hand1 = base_hand + [draw1]  
-        for d1 in set(hand1):
-            hand2 = hand1.copy()
-            hand2.remove(d1)
-            for j in range(len(wall1)):
-                draw2 = wall1[j]
-                wall2 = wall1[:j] + wall1[j+1:]
-                hand3 = hand2 + [draw2]  
-                for d2 in set(hand3):
-                    hand4 = hand3.copy()
-                    hand4.remove(d2)
-                    for k in range(len(wall2)):
-                        draw3 = wall2[k]
-                        hand5 = hand4 + [draw3]  
-                        counts = Counter(hand5)
-                        if all(c <= 4 for c in counts.values()):
-                            hand_counts = [0]*34
-                            for tid in hand5:
-                                hand_counts[tid] += 1
-                            if std_shanten(tuple(hand_counts)) == -1:
-                                full_hand = []
-                                for tid, count in enumerate(hand_counts):
-                                    full_hand += [tid]*count
-                                try:
-                                    score = sc.score(full_hand, melds=[], win_tile=full_hand[0])["points"]
-                                except Exception:
-                                    score = 0
-                            else:
-                                score = 0
-                            hands_scores.append(score)
-    return hands_scores
-def qae_amplitude(scores):
-    n_outcomes = len(scores)
-    n_qubits = int(np.ceil(np.log2(n_outcomes)))
-    ancilla = n_qubits
-    wires = n_qubits + 1
-    WIN_ORACLE = np.array([1 if s > 0 else 0 for s in scores])
-    def apply_uniform_superposition():
-        for i in range(n_qubits):
-            qml.Hadamard(wires=i)
-    def quantum_oracle():
-        for idx in range(n_outcomes):
-            if WIN_ORACLE[idx]:
-                bits = [(idx >> i) & 1 for i in range(n_qubits)]
-                for i, bit in enumerate(bits):
-                    if bit == 0:
-                        qml.PauliX(wires=i)
-                qml.MultiControlledX(wires=list(range(n_qubits)) + [ancilla])
-                for i, bit in enumerate(bits):
-                    if bit == 0:
-                        qml.PauliX(wires=i)
-    dev = qml.device("default.qubit", wires=wires)
-    @qml.qnode(dev)
-    def qae_circuit():
-        apply_uniform_superposition()
-        quantum_oracle()
-        return qml.probs(wires=ancilla)
-    probs = qae_circuit()
-    return probs[1]
-def qae_ev_for_discard(scores, qae_amp=None):
-    n_outcomes = len(scores)
-    if qae_amp is None:
-        qae_amp = qae_amplitude(scores)
-    mean_score_all = np.mean(scores)
-    mean_score_win = np.mean([s for s in scores if s > 0]) if np.sum(np.array(scores) > 0) > 0 else 0
-    win_rate = np.sum(np.array(scores) > 0) / n_outcomes
-    ev_qae = mean_score_win * qae_amp
-    return ev_qae, mean_score_all, win_rate
-def print_ascii_bar_chart(labels, values, max_height=10):
-    max_val = max(values) if max(values) > 0 else 1
-    heights = [int((v / max_val) * max_height) for v in values]
-    for row in range(max_height, 0, -1):
-        line = ""
-        for h in heights:
-            if h >= row:
-                line += "  |  "
-            else:
-                line += "     "
-        print(line)
-    label_line = ""
-    for lbl in labels:
-        label_line += f"{lbl:^5}"
-    print(label_line)
-    print()
-N = 500  
-print(f"\nAveraging QAE EVs for each discard over {N} random walls...")
-unique_discards = sorted(set(hand14))
-evs_by_discard = {d: [] for d in unique_discards}
-counts_by_discard = {d: hand14.count(d) for d in unique_discards}
-pretty_by_discard = {d: pretty(d) for d in unique_discards}
-for wall_idx in tqdm(range(N), desc="QAE calculations (walls)"):
-    wall = shuffled_zero_to_33()[:6]
-    for discard_tile in unique_discards:
-        scores = future_hands_scores(hand14, discard_tile, wall)
-        qae_amp = qae_amplitude(scores)
-        ev_qae, mean_score_all, win_rate = qae_ev_for_discard(scores, qae_amp)
-        evs_by_discard[discard_tile].append(ev_qae)
-results = []
-for d in unique_discards:
-    avg_ev = np.mean(evs_by_discard[d])
-    results.append({
-        "discard": d,
-        "pretty": pretty_by_discard[d],
-        "ev": avg_ev,
-        "count": counts_by_discard[d],
-    })
-results.sort(key=lambda r: -r["ev"])
-print("\nQAE EV (mean over walls) per Discard:\n")
-labels = [r["pretty"] for r in results]
-values = [r["ev"] for r in results]
-print_ascii_bar_chart(labels, values)
-print("Detailed EVs:")
-for r in results:
-    print(f"{r['pretty']:>4} (x{r['count']}): EV = {r['ev']:.2f}")
-best_tile = results[0]["discard"]
-print(f"\nRecommended discard: {pretty(best_tile)} (Avg QAE EV: {results[0]['ev']:.2f})")
+import importlib.util
+import sys
+import os
+
+# ---- Import your discard agent dynamically ----
+spec = importlib.util.spec_from_file_location("discard_agent", "discard_agent.py")
+discard_agent = importlib.util.module_from_spec(spec)
+sys.modules["discard_agent"] = discard_agent
+spec.loader.exec_module(discard_agent)
+
+# ---- Import utils for pretty and tile parsing ----
+spec2 = importlib.util.spec_from_file_location("utils", "utils.py")
+utils = importlib.util.module_from_spec(spec2)
+sys.modules["utils"] = utils
+spec2.loader.exec_module(utils)
+
+def index_to_tile_string(i):
+    # i is 0-33
+    if 0 <= i < 9: return f"{i+1}m"
+    if 9 <= i < 18: return f"{i-8}p"
+    if 18 <= i < 27: return f"{i-17}s"
+    if 27 <= i < 34: return f"{i-26}z"
+    return "?"
+
+def tile_to_char(tile):
+    mapping = {
+        '1z': '1',  # East wind
+        '2z': '2',  # South wind
+        '3z': '3',  # West wind
+        '4z': '4',  # North wind
+        '5z': '5',  # White dragon
+        '6z': '6',  # Green dragon
+        '7z': '7',  # Red dragon
+        **{f"{i+1}m": "qwertyuiop"[i] for i in range(9)},
+        **{f"{i+1}p": "asdfghjkl"[i] for i in range(9)},
+        **{f"{i+1}s": "zxcvbnm,."[i] for i in range(9)},
+    }
+    return mapping.get(tile, '?')
+
+def draw_hand(hand, font, tile_size=48):
+    chars = [tile_to_char(index_to_tile_string(t)) for t in hand]
+
+    text = ''.join(chars)
+    w = tile_size * len(chars)
+    h = tile_size + 20
+    img = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.text((0, 0), text, font=font, fill='white')
+    return img
+
+def parse_hand_input(txt):
+    try:
+        hand = utils.parse_mahjong_hand(txt)
+        if len(hand) != 14:
+            return None, f"Hand must have 14 tiles (you entered {len(hand)})."
+        return hand, None
+    except Exception as e:
+        return None, f"Parse error: {e}"
+
+# ---- Streamlit UI ----
+st.set_page_config(page_title="Riichi Mahjong EV Calculator", layout="centered")
+st.markdown(
+    "<h1 style='display:flex; align-items:center; gap:20px;'>"
+    "Riichi Mahjong EV Calculator <span style='font-size:1.1em;'>🀄</span>"
+    "</h1>",
+    unsafe_allow_html=True
+)
+
+st.markdown("Enter your **14-tile hand** (e.g. <code>123m 456p 789s 11z 777z</code>), then press <b>Evaluate Discard</b>!", unsafe_allow_html=True)
+
+# --- Font loading
+try:
+    font = ImageFont.truetype("mahjong.ttf", 48)
+except Exception:
+    st.error("Missing mahjong.ttf! Please put the font file in the same folder.")
+    st.stop()
+
+with st.form("hand_input_form", clear_on_submit=False):
+    hand_input = st.text_input("Your Hand", "11m 223344p 567899s")
+    submit = st.form_submit_button("Evaluate Discard", use_container_width=True)
+
+if submit:
+    hand, err = parse_hand_input(hand_input)
+    if err:
+        st.error(err)
+    else:
+        st.markdown("### Your Hand")
+        st.image(draw_hand(hand, font), use_container_width=False)
+        with st.spinner("Calculating best discard... (3-step simulation, may take a few seconds)"):
+            try:
+                results, best = discard_agent.evaluate_discards(hand)
+            except Exception as e:
+                st.error(f"Failed to evaluate: {e}")
+                st.stop()
+
+        st.success(f"**Best Discard:** {utils.pretty(best['discard'])}")
+        st.markdown(
+            f"""
+            <b>Winning Probability:</b> {best['p_win']:.2%}  
+            <b>Average Points (if win):</b> {best['avg_win']:.1f}  
+            <b>Expected Value:</b> {best['ev']:.1f}
+            """, unsafe_allow_html=True
+        )
+
+        # Show detailed table
+        st.markdown("#### All Discard Options")
+        import pandas as pd
+        table = pd.DataFrame([{
+            "Discard": utils.pretty(r['discard']),
+            "Win %": f"{r['p_win']:.2%}",
+            "Avg Points (if win)": f"{r['avg_win']:.1f}",
+            "EV": f"{r['ev']:.1f}",
+        } for r in results]).sort_values("EV", ascending=False)
+        st.dataframe(table, hide_index=True, use_container_width=True)
+
+# Footer and credits
+st.markdown("---")
+st.markdown(
+    "<div style='text-align:center;color:gray;font-size:0.92em;'>"
+    "Inspired by <b>Etopen Project</b>. Made with love and cuddles for Julia ♥"
+    "</div>", unsafe_allow_html=True
+)
