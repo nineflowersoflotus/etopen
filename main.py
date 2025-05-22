@@ -1,125 +1,144 @@
-import streamlit as st
-from PIL import ImageFont, ImageDraw, Image
+import pennylane as qml
 import numpy as np
-import importlib.util
-import sys
-import os
+from utils import std_shanten, hand_to_counts
+from score_calculator import ScoreCalculator
 
-# ---- Import your discard agent dynamically ----
-spec = importlib.util.spec_from_file_location("discard_agent", "discard_agent.py")
-discard_agent = importlib.util.module_from_spec(spec)
-sys.modules["discard_agent"] = discard_agent
-spec.loader.exec_module(discard_agent)
 
-# ---- Import utils for pretty and tile parsing ----
-spec2 = importlib.util.spec_from_file_location("utils", "utils.py")
-utils = importlib.util.module_from_spec(spec2)
-sys.modules["utils"] = utils
-spec2.loader.exec_module(utils)
+# CONFIGURATION (tweak these for your setup)
+TILE_TYPES = 9
+N_WALL_TILES = 3
+N_CYCLES = 2
+INITIAL_HAND = [1, 1, 2, 2, 3, 3, 4, 4, 5, 6, 7, 8, 9, 9, 9]  # Example 14-tile hand
 
-def index_to_tile_string(i):
-    # i is 0-33
-    if 0 <= i < 9: return f"{i+1}m"
-    if 9 <= i < 18: return f"{i-8}p"
-    if 18 <= i < 27: return f"{i-17}s"
-    if 27 <= i < 34: return f"{i-26}z"
-    return "?"
+WALL_BITS = N_WALL_TILES * int(np.ceil(np.log2(TILE_TYPES)))
+DRAW_BITS = [int(np.ceil(np.log2(N_WALL_TILES - i))) for i in range(N_CYCLES)]
+DISCARD_BITS = [int(np.ceil(np.log2(len(INITIAL_HAND) + i + 1))) for i in range(N_CYCLES)]
+TOTAL_BITS = WALL_BITS + sum(DRAW_BITS) + sum(DISCARD_BITS)
+dev = qml.device("default.qubit", wires=TOTAL_BITS, shots=2000)
 
-def tile_to_char(tile):
-    mapping = {
-        '1z': '1',  # East wind
-        '2z': '2',  # South wind
-        '3z': '3',  # West wind
-        '4z': '4',  # North wind
-        '5z': '5',  # White dragon
-        '6z': '6',  # Green dragon
-        '7z': '7',  # Red dragon
-        **{f"{i+1}m": "qwertyuiop"[i] for i in range(9)},
-        **{f"{i+1}p": "asdfghjkl"[i] for i in range(9)},
-        **{f"{i+1}s": "zxcvbnm,."[i] for i in range(9)},
-    }
-    return mapping.get(tile, '?')
+def bits_to_wall(bits):
+    wall = []
+    bits_per_tile = int(np.ceil(np.log2(TILE_TYPES)))
+    for i in range(N_WALL_TILES):
+        idx = 0
+        for j in range(bits_per_tile):
+            idx = (idx << 1) | bits[bits_per_tile * i + j]
+        if idx >= TILE_TYPES:
+            return None
+        wall.append(idx)
+    return wall
 
-def draw_hand(hand, font, tile_size=48):
-    chars = [tile_to_char(index_to_tile_string(t)) for t in hand]
+def decode_trajectory(bits, first_discard):
+    offset = 0
+    bits_per_tile = int(np.ceil(np.log2(TILE_TYPES)))
+    wall_bits = bits[offset:offset + N_WALL_TILES * bits_per_tile]
+    wall = bits_to_wall(wall_bits)
+    if wall is None:
+        return None
+    offset += N_WALL_TILES * bits_per_tile
 
-    text = ''.join(chars)
-    w = tile_size * len(chars)
-    h = tile_size + 20
-    img = Image.new('RGBA', (w, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.text((0, 0), text, font=font, fill='white')
-    return img
+    draw_choices = []
+    for i, db in enumerate(DRAW_BITS):
+        if db == 0:
+            draw_choices.append(0)
+        else:
+            val = 0
+            for j in range(db):
+                val = (val << 1) | bits[offset + j]
+            if val >= len(wall) - i:
+                return None
+            draw_choices.append(val)
+        offset += db
 
-def parse_hand_input(txt):
-    try:
-        hand = utils.parse_mahjong_hand(txt)
-        if len(hand) != 14:
-            return None, f"Hand must have 14 tiles (you entered {len(hand)})."
-        return hand, None
-    except Exception as e:
-        return None, f"Parse error: {e}"
+    discard_choices = []
+    # The first discard is always fixed!
+    discard_choices.append(first_discard)
+    for i, db in enumerate(DISCARD_BITS[1:], start=1):
+        if db == 0:
+            discard_choices.append(0)
+        else:
+            val = 0
+            for j in range(db):
+                val = (val << 1) | bits[offset + j]
+            if val >= len(INITIAL_HAND) + i:
+                return None
+            discard_choices.append(val)
+        offset += db
 
-# ---- Streamlit UI ----
-st.set_page_config(page_title="Riichi Mahjong EV Calculator", layout="centered")
-st.markdown(
-    "<h1 style='display:flex; align-items:center; gap:20px;'>"
-    "Riichi Mahjong EV Calculator <span style='font-size:1.1em;'>🀄</span>"
-    "</h1>",
-    unsafe_allow_html=True
-)
+    hand = INITIAL_HAND.copy()
+    wall_left = wall.copy()
+    for draw_idx, discard_idx in zip(draw_choices, discard_choices):
+        if draw_idx >= len(wall_left):
+            return None
+        hand.append(wall_left[draw_idx])
+        wall_left.pop(draw_idx)
+        if discard_idx >= len(hand):
+            return None
+        hand.pop(discard_idx)
+    return hand
 
-st.markdown("Enter your **14-tile hand** (e.g. <code>123m 456p 789s 11z 777z</code>), then press <b>Evaluate Discard</b>!", unsafe_allow_html=True)
+def pretty_hand(hand):
+    return " ".join(f"{t}m" for t in sorted(hand))
 
-# --- Font loading
-try:
-    font = ImageFont.truetype("mahjong.ttf", 48)
-except Exception:
-    st.error("Missing mahjong.ttf! Please put the font file in the same folder.")
-    st.stop()
+def is_win(hand):
+    if hand is None:
+        return False
+    return std_shanten(tuple(hand_to_counts(hand))) == -1
 
-with st.form("hand_input_form", clear_on_submit=False):
-    hand_input = st.text_input("Your Hand", "11m 223344p 567899s")
-    submit = st.form_submit_button("Evaluate Discard", use_container_width=True)
+scorecalc = ScoreCalculator()
 
-if submit:
-    hand, err = parse_hand_input(hand_input)
-    if err:
-        st.error(err)
-    else:
-        st.markdown("### Your Hand")
-        st.image(draw_hand(hand, font), use_container_width=False)
-        with st.spinner("Calculating best discard... (3-step simulation, may take a few seconds)"):
-            try:
-                results, best = discard_agent.evaluate_discards(hand)
-            except Exception as e:
-                st.error(f"Failed to evaluate: {e}")
-                st.stop()
+def run_qae_for_discard(first_discard, discard0_offset, discard0_bits):
+    discard0_bin = [int(x) for x in format(first_discard, f'0{discard0_bits}b')]
 
-        st.success(f"**Best Discard:** {utils.pretty(best['discard'])}")
-        st.markdown(
-            f"""
-            <b>Winning Probability:</b> {best['p_win']:.2%}  
-            <b>Average Points (if win):</b> {best['avg_win']:.1f}  
-            <b>Expected Value:</b> {best['ev']:.1f}
-            """, unsafe_allow_html=True
-        )
+    @qml.qnode(dev)
+    def circuit():
+        for i in range(TOTAL_BITS):
+            if discard0_offset <= i < discard0_offset + discard0_bits:
+                continue
+            qml.Hadamard(wires=i)
+        for b, wire in zip(discard0_bin, range(discard0_offset, discard0_offset + discard0_bits)):
+            if b == 1:
+                qml.PauliX(wires=wire)
+        return qml.sample(wires=range(TOTAL_BITS))
 
-        # Show detailed table
-        st.markdown("#### All Discard Options")
-        import pandas as pd
-        table = pd.DataFrame([{
-            "Discard": utils.pretty(r['discard']),
-            "Win %": f"{r['p_win']:.2%}",
-            "Avg Points (if win)": f"{r['avg_win']:.1f}",
-            "EV": f"{r['ev']:.1f}",
-        } for r in results]).sort_values("EV", ascending=False)
-        st.dataframe(table, hide_index=True, use_container_width=True)
+    samples = circuit()
+    win_count = 0
+    total_count = 0
+    score_sum = 0
+    for bits in samples:
+        hand = decode_trajectory(bits, first_discard)
+        if hand is not None:
+            total_count += 1
+            if is_win(hand):
+                win_count += 1
+                # --- Score Calculation ---
+                # Determine the winning tile: last drawn tile
+                # (Assume the last tile added was the win tile)
+                win_tile = hand[-1]
+                # You may need to reconstruct melds if possible; for now, assume fully closed hand
+                result = scorecalc.score(full_hand=hand, melds=[], win_tile=win_tile, is_tsumo=True, riichi=False)
+                score_sum += result['points']
+    win_prob = win_count / total_count if total_count else 0
+    ev = score_sum / total_count if total_count else 0
+    return win_prob, ev, total_count
 
-# Footer and credits
-st.markdown("---")
-st.markdown(
-    "<div style='text-align:center;color:gray;font-size:0.92em;'>"
-    "Inspired by <b>Etopen Project</b>. Made with love and cuddles for Julia ♥"
-    "</div>", unsafe_allow_html=True
-)
+def main():
+    # Offsets for first discard in the register
+    discard0_offset = WALL_BITS + sum(DRAW_BITS)
+    discard0_bits = DISCARD_BITS[0]
+    print(f"Initial hand: {pretty_hand(INITIAL_HAND)}")
+    print(f"Evaluating quantum win probability for all possible first discards...")
+
+    # Try every possible initial discard index
+    results = []
+    for discard_idx in range(len(INITIAL_HAND)):
+        win_prob, ev, total = run_qae_for_discard(discard_idx, discard0_offset, discard0_bits)
+        print(f"  Discard {discard_idx} ({INITIAL_HAND[discard_idx]}m): Win probability = {win_prob:.6f}, EV = {ev:.2f}  (samples: {total})")
+    print("\nSummary:")
+    for idx, tile, prob, n in results:
+        print(f"Discarding tile {idx} ({tile}m): Win probability {prob:.4f} (n={n})")
+
+    
+
+if __name__ == "__main__":
+    main()
